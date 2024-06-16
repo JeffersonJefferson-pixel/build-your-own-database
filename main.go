@@ -158,17 +158,14 @@ func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
 
 // update key for a leaf node
 func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
-	fmt.Printf("updating leaf: {%s: %s} %d\n", string(key), string(val), len(key))
 	new.setHeader(BNODE_LEAF, old.nkeys())
-	nodeAppendRange(new, old, 0, 0, idx-1)
+	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, 0, key, val)
 	nodeAppendRange(new, old, idx+1, idx+1, old.nkeys()-(idx+1))
-	fmt.Printf("key: %s\n", string(new.getKey(idx)))
 }
 
 // copy a KV into the position
 func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
-	fmt.Printf("appending kv: {%s: %s} %d\n", string(key), string(val), uint16(len(key)))
 	// ptrs
 	new.setPtr(idx, ptr)
 	// kvs
@@ -197,7 +194,7 @@ func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint1
 	// offsets
 	dstBegin := new.getOffset(dstNew)
 	srcBegin := old.getOffset(srcOld)
-	for i := uint16(1); i <= n; i++ {
+	for i := uint16(1); i <= n; i++ { // NOTE: the range is [1, n]
 		offset := dstBegin + old.getOffset(srcOld+i) - srcBegin
 		new.setOffset(dstNew+i, offset)
 	}
@@ -220,7 +217,6 @@ func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children .
 
 // split a oversized node into 2
 func nodeSplit2(left BNode, right BNode, old BNode) {
-	fmt.Printf("splitting\n")
 	left.setHeader(old.btype(), ((old.nkeys()-1)/2)+1)
 	nodeAppendRange(left, old, 0, 0, ((old.nkeys()-1)/2)+1)
 	right.setHeader(old.btype(), old.nkeys()/2)
@@ -230,7 +226,6 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 // split a node. the results are 1~3 nodes.
 func nodeSplit3(old BNode) (uint16, [3]BNode) {
 	if old.nbytes() <= BTREE_PAGE_SIZE {
-		fmt.Printf("node does not exceed page side\n")
 		old.data = old.data[:BTREE_PAGE_SIZE]
 		return 1, [3]BNode{old} // not split
 	}
@@ -335,13 +330,11 @@ func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
 	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
 	switch {
 	case mergeDir < 0: // left
-		fmt.Printf("merged left\n")
 		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
 		nodeMerge(merged, sibling, updated)
 		tree.del(node.getPtr(idx - 1))
 		nodeReplace2Child(new, node, idx-1, tree.new(merged), merged.getKey(0))
 	case mergeDir > 0: // right
-		fmt.Printf("merged right\n")
 		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
 		nodeMerge(merged, updated, sibling)
 		tree.del(node.getPtr(idx + 1))
@@ -389,7 +382,7 @@ func shouldMerge(
 // replace 2 adjacent link with one link
 func nodeReplace2Child(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
 	new.setHeader(BNODE_NODE, old.nkeys()-1)
-	nodeAppendRange(new, old, 0, 0, idx-1)
+	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, ptr, key, nil)
 	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+2))
 }
@@ -507,9 +500,9 @@ func main() {
 	var aIdx, bIdx, cIdx, dIdx, eIdx uint16
 
 	c := newC()
-	c.add("a", "3")
+	c.add("a", "1")
 	c.add("b", "2")
-	c.add("c", "1")
+	c.add("c", "3")
 	c.add("d", "4")
 	c.add("e", "5")
 	tree = c.tree
@@ -521,12 +514,12 @@ func main() {
 	eIdx = nodeLookupLE(root, []byte("e"))
 	fmt.Printf("a: %s, b: %s, c: %s, d: %s, e: %s\n", root.getVal(aIdx), root.getVal(bIdx), root.getVal(cIdx), root.getVal(dIdx), root.getVal(eIdx))
 
-	// c.add("a", "6")
-	// c.add("c", "7")
+	c.add("a", "6")
+	c.add("c", "7")
 	c.del("b")
 	c.del("d")
-	// c.add("b", "8")
-	// c.add("d", "9")
+	c.add("b", "8")
+	c.add("d", "9")
 	tree = c.tree
 	root = tree.get(tree.root)
 	aIdx = nodeLookupLE(root, []byte("a"))
