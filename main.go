@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"unsafe"
 )
 
 /*
@@ -28,9 +30,9 @@ type BTree struct {
 	// pointer (a nonzero page number)
 	root uint64
 	// callbacks for managing on-disk pages
-	get func(uint64) []byte // dereference a pointer
-	new func([]byte) uint64 // allocate a new page
-	del func(uint64)        // deallocate a page
+	get func(uint64) BNode // dereference a pointer
+	new func(BNode) uint64 // allocate a new page
+	del func(uint64)       // deallocate a page
 }
 
 const (
@@ -39,8 +41,12 @@ const (
 )
 
 var (
-	ErrBNodeTooLarge   = errors.New("b-tree node exceeds page size")
-	ErrIndexOutOfBound = errors.New("index is out-of-bound")
+	ErrBNodeTooLarge      = errors.New("b-tree node exceeds page size")
+	ErrIndexOutOfBound    = errors.New("index is out-of-bound")
+	ErrEmptyKey           = errors.New("key is empty")
+	ErrKeyTooLarge        = errors.New("key is too large")
+	ErrValueTooLarge      = errors.New("value is too large")
+	ErrSomethingWentWrong = errors.New("something went wrong")
 )
 
 func init() {
@@ -54,7 +60,8 @@ func assert(assertion bool, err error) {
 	}
 }
 
-func (node BNode) byte() uint16 {
+// header
+func (node BNode) btype() uint16 {
 	return binary.LittleEndian.Uint16(node.data[0:2])
 }
 
@@ -97,8 +104,9 @@ func (node BNode) setOffset(idx uint16, offset uint16) {
 	binary.LittleEndian.PutUint16(node.data[offsetPos(node, idx):], offset)
 }
 
+// key-values
 func (node BNode) kvPos(idx uint16) uint16 {
-	assert(idx < node.nkeys(), ErrIndexOutOfBound)
+	assert(idx <= node.nkeys(), ErrIndexOutOfBound)
 	return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
 }
 
@@ -112,7 +120,7 @@ func (node BNode) getKey(idx uint16) []byte {
 func (node BNode) getVal(idx uint16) []byte {
 	assert(idx < node.nkeys(), ErrIndexOutOfBound)
 	pos := node.kvPos(idx)
-	klen := binary.LittleEndian.Uint16(node.data[pos:])
+	klen := binary.LittleEndian.Uint16(node.data[pos+0:])
 	vlen := binary.LittleEndian.Uint16(node.data[pos+2:])
 	return node.data[pos+4+klen:][:vlen]
 }
@@ -122,10 +130,12 @@ func (node BNode) nbytes() uint16 {
 	return node.kvPos(node.nkeys())
 }
 
+// returns the first child node  whose range intersects the key (child[i] <= key)
 func nodeLookupLE(node BNode, key []byte) uint16 {
 	nkeys := node.nkeys()
 	found := uint16(0)
-
+	// the first key is a copy from the parent node,
+	// thus it's always less than or equal to the key.
 	for i := uint16(1); i < nkeys; i++ {
 		cmp := bytes.Compare(node.getKey(i), key)
 		if cmp <= 0 {
@@ -136,4 +146,393 @@ func nodeLookupLE(node BNode, key []byte) uint16 {
 		}
 	}
 	return found
+}
+
+// add a new key to a leaf node
+func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+}
+
+// update key for a leaf node
+func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	fmt.Printf("updating leaf: {%s: %s} %d\n", string(key), string(val), len(key))
+	new.setHeader(BNODE_LEAF, old.nkeys())
+	nodeAppendRange(new, old, 0, 0, idx-1)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx+1, old.nkeys()-(idx+1))
+	fmt.Printf("key: %s\n", string(new.getKey(idx)))
+}
+
+// copy a KV into the position
+func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
+	fmt.Printf("appending kv: {%s: %s} %d\n", string(key), string(val), uint16(len(key)))
+	// ptrs
+	new.setPtr(idx, ptr)
+	// kvs
+	pos := new.kvPos(idx)
+	binary.LittleEndian.PutUint16(new.data[pos+0:], uint16(len(key)))
+	binary.LittleEndian.PutUint16(new.data[pos+2:], uint16(len(val)))
+	copy(new.data[pos+4:], key)
+	copy(new.data[pos+4+uint16(len(key)):], val)
+	// offset of the next key
+	new.setOffset(idx+1, new.getOffset(idx)+4+uint16((len(key)+len(val))))
+}
+
+// copy multiple KVs into the position from the old node
+func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
+	assert(srcOld+n <= old.nkeys(), ErrIndexOutOfBound)
+	assert(dstNew+n <= new.nkeys(), ErrIndexOutOfBound)
+
+	if n == 0 {
+		return
+	}
+
+	// pointers
+	for i := uint16(0); i < n; i++ {
+		new.setPtr(dstNew+i, old.getPtr(srcOld+i))
+	}
+	// offsets
+	dstBegin := new.getOffset(dstNew)
+	srcBegin := old.getOffset(srcOld)
+	for i := uint16(1); i <= n; i++ {
+		offset := dstBegin + old.getOffset(srcOld+i) - srcBegin
+		new.setOffset(dstNew+i, offset)
+	}
+	// KVs
+	begin := old.kvPos(srcOld)
+	end := old.kvPos(srcOld + n)
+	copy(new.data[new.kvPos(dstNew):], old.data[begin:end])
+}
+
+// replace a link with one or multiple links
+func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children ...BNode) {
+	inc := uint16(len(children))
+	new.setHeader(BNODE_NODE, old.nkeys()+inc-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	for i, node := range children {
+		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
+	}
+	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
+}
+
+// split a oversized node into 2
+func nodeSplit2(left BNode, right BNode, old BNode) {
+	fmt.Printf("splitting\n")
+	left.setHeader(old.btype(), ((old.nkeys()-1)/2)+1)
+	nodeAppendRange(left, old, 0, 0, ((old.nkeys()-1)/2)+1)
+	right.setHeader(old.btype(), old.nkeys()/2)
+	nodeAppendRange(right, old, 0, ((old.nkeys()-1)/2)+1, old.nkeys()/2)
+}
+
+// split a node. the results are 1~3 nodes.
+func nodeSplit3(old BNode) (uint16, [3]BNode) {
+	if old.nbytes() <= BTREE_PAGE_SIZE {
+		fmt.Printf("node does not exceed page side\n")
+		old.data = old.data[:BTREE_PAGE_SIZE]
+		return 1, [3]BNode{old} // not split
+	}
+	left := BNode{make([]byte, 2*BTREE_PAGE_SIZE)} // might be split later
+	right := BNode{make([]byte, BTREE_PAGE_SIZE)}
+	nodeSplit2(left, right, old)
+	if left.nbytes() <= BTREE_PAGE_SIZE {
+		left.data = left.data[:BTREE_PAGE_SIZE]
+		return 2, [3]BNode{left, right}
+	}
+	// the left node is still too large
+	leftleft := BNode{make([]byte, BTREE_PAGE_SIZE)}
+	middle := BNode{make([]byte, BTREE_PAGE_SIZE)}
+	nodeSplit2(leftleft, middle, left)
+	assert(leftleft.nbytes() <= BTREE_PAGE_SIZE, ErrBNodeTooLarge)
+	return 3, [3]BNode{leftleft, middle, right}
+}
+
+// insert a KV into a node, the result might be split.
+// the caller is responsible for deallocating the input node
+// and splitting and allocating result nodes.
+func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
+	// the result node.
+	// it is allowed to be bigger than 1 page and will be split if sno
+	new := BNode{data: make([]byte, 2*BTREE_PAGE_SIZE)}
+
+	// where to insert the key
+	idx := nodeLookupLE(node, key)
+	switch node.btype() {
+	case BNODE_LEAF:
+		if bytes.Equal(key, node.getKey(idx)) {
+			// found key, update it.
+			leafUpdate(new, node, idx, key, val)
+		} else {
+			// insert after the position
+			leafInsert(new, node, idx+1, key, val)
+		}
+
+	case BNODE_NODE:
+		nodeInsert(tree, new, node, idx, key, val)
+	default:
+		panic("bad node!")
+	}
+
+	// root := tree.get(tree.root)
+	// nodeLookupLE(root, []byte("a"))
+	return new
+}
+
+// KV insertion to an internal node
+func nodeInsert(tree *BTree, new BNode, node BNode, idx uint16, key []byte, val []byte) {
+	// get and deallocate the child node
+	cptr := node.getPtr(idx)
+	cnode := tree.get(cptr)
+	tree.del(cptr)
+	// recursive insertion to the child node
+	cnode = treeInsert(tree, cnode, key, val)
+	// splitted the result
+	nsplit, splitted := nodeSplit3(cnode)
+	// update the child links
+	nodeReplaceChildN(tree, new, node, idx, splitted[:nsplit]...)
+}
+
+// remove a key from a leaf node
+func leafDelete(new BNode, old BNode, idx uint16) {
+	new.setHeader(BNODE_LEAF, old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendRange(new, old, idx, idx+1, old.nkeys()-(idx+1))
+}
+
+// delete a key from the tree
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	// where to find the key?
+	idx := nodeLookupLE(node, key)
+	switch node.btype() {
+	case BNODE_LEAF:
+		if !bytes.Equal(key, node.getKey(idx)) {
+			return BNode{} // not found
+		}
+		// delete the key in the leaf
+		new := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		leafDelete(new, node, idx)
+		return new
+	case BNODE_NODE:
+		return nodeDelete(tree, node, idx, key)
+	default:
+		panic("bad node!")
+	}
+}
+
+func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	// recurse into the child
+	cptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(cptr), key)
+	if len(updated.data) == 0 {
+		return BNode{} // not found
+	}
+	tree.del(cptr)
+
+	new := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+	// check for merging
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0: // left
+		fmt.Printf("merged left\n")
+		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx - 1))
+		nodeReplace2Child(new, node, idx-1, tree.new(merged), merged.getKey(0))
+	case mergeDir > 0: // right
+		fmt.Printf("merged right\n")
+		merged := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getPtr(idx + 1))
+		nodeReplace2Child(new, node, idx, tree.new(merged), merged.getKey(0))
+	case mergeDir == 0:
+		assert(updated.nkeys() > 0, ErrSomethingWentWrong)
+		nodeReplaceChildN(tree, new, node, idx, updated)
+	}
+	return new
+}
+
+// merge 2 nodes into 1
+func nodeMerge(new BNode, left BNode, right BNode) {
+	new.setHeader(left.btype(), left.nkeys()+right.nkeys())
+	nodeAppendRange(new, left, 0, 0, left.nkeys())
+	nodeAppendRange(new, right, left.nkeys(), 0, right.nkeys())
+}
+
+// should the updated child be merged with a sibling?
+func shouldMerge(
+	tree *BTree, node BNode, idx uint16, updated BNode,
+) (int, BNode) {
+	if updated.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		sibling := tree.get(node.getPtr(idx - 1))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return -1, sibling
+		}
+
+	}
+	if idx+1 < node.nkeys() {
+		sibling := tree.get(node.getPtr(idx + 1))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return +1, sibling
+		}
+	}
+	return 0, BNode{}
+}
+
+// replace 2 adjacent link with one link
+func nodeReplace2Child(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
+	new.setHeader(BNODE_NODE, old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx-1)
+	nodeAppendKV(new, idx, ptr, key, nil)
+	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+2))
+}
+
+// root node
+
+// delete a key and returns whether the key was there
+func (tree *BTree) Delete(key []byte) bool {
+	assert(len(key) != 0, ErrEmptyKey)
+	assert(len(key) <= BTREE_MAX_KEY_SIZE, ErrKeyTooLarge)
+	if tree.root == 0 {
+		return false
+	}
+
+	updated := treeDelete(tree, tree.get(tree.root), key)
+	if len(updated.data) == 0 {
+		return false // not found
+	}
+
+	tree.del(tree.root)
+	if updated.btype() == BNODE_NODE && updated.nkeys() == 1 {
+		// remove a level
+		tree.root = updated.getPtr(0)
+	} else {
+		tree.root = tree.new(updated)
+	}
+
+	return true
+}
+
+// insert a new key or update an existing key
+func (tree *BTree) Insert(key []byte, val []byte) {
+	assert(len(key) != 0, ErrEmptyKey)
+	assert(len(key) <= BTREE_MAX_KEY_SIZE, ErrKeyTooLarge)
+	assert(len(val) <= BTREE_MAX_VAL_SIZE, ErrValueTooLarge)
+
+	if tree.root == 0 {
+		// create the first node
+		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		root.setHeader(BNODE_LEAF, 2)
+		// a dummy key, this makes the tree cover the whole key space.
+		// thus a lookup can always find a containing node.
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+		tree.root = tree.new(root)
+		return
+	}
+
+	node := tree.get(tree.root)
+	tree.del(tree.root)
+
+	node = treeInsert(tree, node, key, val)
+	nsplit, splitted := nodeSplit3(node)
+
+	if nsplit > 1 {
+		// the root was split, add a new level.
+		root := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		root.setHeader(BNODE_NODE, nsplit)
+		for i, cnode := range splitted[:nsplit] {
+			ptr, key := tree.new(cnode), cnode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(splitted[0])
+	}
+}
+
+type C struct {
+	tree  BTree
+	ref   map[string]string
+	pages map[uint64]BNode
+}
+
+func newC() *C {
+	pages := map[uint64]BNode{}
+	return &C{
+		tree: BTree{
+			get: func(ptr uint64) BNode {
+				node, ok := pages[ptr]
+				assert(ok, ErrSomethingWentWrong)
+				return node
+			},
+			new: func(node BNode) uint64 {
+				assert(node.nbytes() <= BTREE_PAGE_SIZE, ErrBNodeTooLarge)
+				key := uint64(uintptr(unsafe.Pointer(&node.data[0])))
+				assert(pages[key].data == nil, ErrSomethingWentWrong)
+				pages[key] = node
+				return key
+			},
+			del: func(ptr uint64) {
+				_, ok := pages[ptr]
+				assert(ok, ErrSomethingWentWrong)
+				delete(pages, ptr)
+			},
+		},
+		ref:   map[string]string{},
+		pages: pages,
+	}
+}
+
+func (c *C) add(key string, val string) {
+	c.tree.Insert([]byte(key), []byte(val))
+	c.ref[key] = val
+}
+
+func (c *C) del(key string) bool {
+	delete(c.ref, key)
+	return c.tree.Delete([]byte(key))
+}
+
+func main() {
+	var tree BTree
+	var root BNode
+	var aIdx, bIdx, cIdx, dIdx, eIdx uint16
+
+	c := newC()
+	c.add("a", "3")
+	c.add("b", "2")
+	c.add("c", "1")
+	c.add("d", "4")
+	c.add("e", "5")
+	tree = c.tree
+	root = tree.get(tree.root)
+	aIdx = nodeLookupLE(root, []byte("a"))
+	bIdx = nodeLookupLE(root, []byte("b"))
+	cIdx = nodeLookupLE(root, []byte("c"))
+	dIdx = nodeLookupLE(root, []byte("d"))
+	eIdx = nodeLookupLE(root, []byte("e"))
+	fmt.Printf("a: %s, b: %s, c: %s, d: %s, e: %s\n", root.getVal(aIdx), root.getVal(bIdx), root.getVal(cIdx), root.getVal(dIdx), root.getVal(eIdx))
+
+	// c.add("a", "6")
+	// c.add("c", "7")
+	c.del("b")
+	c.del("d")
+	// c.add("b", "8")
+	// c.add("d", "9")
+	tree = c.tree
+	root = tree.get(tree.root)
+	aIdx = nodeLookupLE(root, []byte("a"))
+	bIdx = nodeLookupLE(root, []byte("b"))
+	cIdx = nodeLookupLE(root, []byte("c"))
+	dIdx = nodeLookupLE(root, []byte("d"))
+	eIdx = nodeLookupLE(root, []byte("e"))
+	fmt.Printf("a: %s, b: %s, c: %s, d: %s, e: %s", root.getVal(aIdx), root.getVal(bIdx), root.getVal(cIdx), root.getVal(dIdx), root.getVal(eIdx))
 }
