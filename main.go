@@ -451,6 +451,15 @@ func (tree *BTree) Insert(key []byte, val []byte) {
 	}
 }
 
+func (tree *BTree) Get(key []byte) ([]byte, bool) {
+	root := tree.get(tree.root)
+	idx := nodeLookupLE(root, key)
+	if bytes.Equal(key, root.getKey(idx)) {
+		return root.getVal(idx), true
+	}
+	return nil, false
+}
+
 type C struct {
 	tree  BTree
 	ref   map[string]string
@@ -495,37 +504,24 @@ func (c *C) del(key string) bool {
 }
 
 func main() {
-	var tree BTree
-	var root BNode
-	var aIdx, bIdx, cIdx, dIdx, eIdx uint16
+	var db KV
+	db.Path = "testdb"
+	if err := db.Open(); err != nil {
+		panic(err)
+	}
+	key1 := "a"
+	key2 := "b"
+	if err := db.Set([]byte(key1), []byte("1")); err != nil {
+		panic(err)
+	}
+	val1, _ := db.Get([]byte(key1))
+	fmt.Printf("%s: %s\n", key1, val1)
 
-	c := newC()
-	c.add("a", "1")
-	c.add("b", "2")
-	c.add("c", "3")
-	c.add("d", "4")
-	c.add("e", "5")
-	tree = c.tree
-	root = tree.get(tree.root)
-	aIdx = nodeLookupLE(root, []byte("a"))
-	bIdx = nodeLookupLE(root, []byte("b"))
-	cIdx = nodeLookupLE(root, []byte("c"))
-	dIdx = nodeLookupLE(root, []byte("d"))
-	eIdx = nodeLookupLE(root, []byte("e"))
-	fmt.Printf("a: %s, b: %s, c: %s, d: %s, e: %s\n", root.getVal(aIdx), root.getVal(bIdx), root.getVal(cIdx), root.getVal(dIdx), root.getVal(eIdx))
-
-	c.add("a", "6")
-	c.add("c", "7")
-	c.del("b")
-	c.del("d")
-	c.add("b", "8")
-	c.add("d", "9")
-	tree = c.tree
-	root = tree.get(tree.root)
-	aIdx = nodeLookupLE(root, []byte("a"))
-	bIdx = nodeLookupLE(root, []byte("b"))
-	cIdx = nodeLookupLE(root, []byte("c"))
-	dIdx = nodeLookupLE(root, []byte("d"))
-	eIdx = nodeLookupLE(root, []byte("e"))
-	fmt.Printf("a: %s, b: %s, c: %s, d: %s, e: %s", root.getVal(aIdx), root.getVal(bIdx), root.getVal(cIdx), root.getVal(dIdx), root.getVal(eIdx))
+	val2, _ := db.Get([]byte(key2))
+	fmt.Printf("%s: %s\n", key2, val2)
+	if err := db.Set([]byte(key2), []byte("2")); err != nil {
+		panic(err)
+	}
+	val2, _ = db.Get([]byte(key2))
+	fmt.Printf("%s: %s\n", key2, val2)
 }
