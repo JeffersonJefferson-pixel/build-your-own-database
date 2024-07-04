@@ -1,6 +1,9 @@
 package main
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+)
 
 /*
 | type | size | total | next | pointers |
@@ -23,12 +26,41 @@ type FreeList struct {
 	use func(uint64, BNode) // reuse a page
 }
 
-func flnSize(node BNode) int
-func flnNext(node BNode) uint64
-func flnPtr(node BNode, idx int) uint64
-func flnSetPtr(node BNode, idx int, ptr uint64)
-func flnSetHeader(node BNode, size uint16, next uint64)
-func flnSetTotal(node BNode, total uint64)
+func flnSize(node BNode) int {
+	return int(binary.LittleEndian.Uint16(node.data[2:4]))
+}
+
+func flnNext(node BNode) uint64 {
+	return binary.LittleEndian.Uint64(node.data[12:20])
+}
+
+func flnPtr(node BNode, idx int) uint64 {
+	assert(idx < flnSize(node), ErrIndexOutOfBound)
+	pos := HEADER + 8*idx
+	return binary.LittleEndian.Uint64(node.data[pos:])
+}
+
+func flnSetPtr(node BNode, idx int, ptr uint64) {
+	assert(idx < flnSize(node), ErrIndexOutOfBound)
+	pos := HEADER + 8*idx
+	binary.LittleEndian.PutUint64(node.data[pos:], ptr)
+}
+
+func flnSetHeader(node BNode, size uint16, next uint64) {
+	binary.LittleEndian.PutUint16(node.data[2:4], size)
+	binary.LittleEndian.PutUint64(node.data[12:20], next)
+}
+
+// number of items in the list
+func (fl *FreeList) Total() int {
+	head := fl.get(fl.head)
+	return int(binary.LittleEndian.Uint64(head.data[4:12]))
+}
+
+func flnSetTotal(node BNode, total uint64) {
+	binary.LittleEndian.PutUint64(node.data[4:12], total)
+}
+
 func flPush(fl *FreeList, freed []uint64, reuse []uint64) {
 	for len(freed) > 0 {
 		new := BNode{make([]byte, BTREE_PAGE_SIZE)}
@@ -55,9 +87,6 @@ func flPush(fl *FreeList, freed []uint64, reuse []uint64) {
 	}
 	assert(len(reuse) == 0, ErrSomethingWentWrong)
 }
-
-// number of items in the list
-func (fl *FreeList) Total() int
 
 // get the nth pointer
 func (fl *FreeList) Get(topn int) uint64 {
