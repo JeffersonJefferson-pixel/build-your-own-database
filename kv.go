@@ -110,7 +110,8 @@ const DB_SIG = "BuildYourOwnDB05"
 func masterLoad(db *KV) error {
 	if db.mmap.file == 0 {
 		// empty the file, the master page will be created on the first write.
-		db.page.flushed = 1 // reserved for the master page
+		db.page.flushed = 2 // reserved for the master page
+		db.free.head = 0
 		return nil
 	}
 
@@ -222,6 +223,13 @@ func (db *KV) Open() error {
 	if err != nil {
 		goto fail
 	}
+
+	// free list
+	db.free.get = db.pageGet
+	db.free.new = db.pageNew
+	db.free.use = db.pageUse
+	db.page.updates = map[uint64][]byte{}
+
 	// done
 	return nil
 
@@ -273,7 +281,7 @@ func writePages(db *KV) error {
 	}
 	db.free.Update(db.page.nfree, freed)
 
-	npages := int(db.page.flushed) + len(db.page.temp)
+	npages := int(db.page.flushed) + db.page.nappend + db.page.nfree
 	if err := extendFile(db, npages); err != nil {
 		return err
 	}
@@ -294,8 +302,8 @@ func syncPages(db *KV) error {
 	if err := db.fp.Sync(); err != nil {
 		return fmt.Errorf("fsync: %w", err)
 	}
-	db.page.flushed += uint64(len(db.page.temp))
-	db.page.temp = db.page.temp[:0]
+	db.page.flushed += uint64(db.page.nappend)
+	clear(db.page.updates)
 
 	// update & flush the master page
 	if err := masterStore(db); err != nil {

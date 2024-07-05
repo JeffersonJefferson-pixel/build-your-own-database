@@ -53,6 +53,9 @@ func flnSetHeader(node BNode, size uint16, next uint64) {
 
 // number of items in the list
 func (fl *FreeList) Total() int {
+	if fl.head == 0 {
+		return 0
+	}
 	head := fl.get(fl.head)
 	return int(binary.LittleEndian.Uint64(head.data[4:12]))
 }

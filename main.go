@@ -69,4 +69,18 @@ func main() {
 	}
 	val2, _ = db.Get([]byte(key2))
 	fmt.Printf("%s: %s\n", key2, val2)
+
+	// delete
+	if _, err := db.Del([]byte(key1)); err != nil {
+		panic(err)
+	}
+	val1, _ = db.Get([]byte(key1))
+	fmt.Printf("%s: %s\n", key1, val1)
+
+	if err := db.Set([]byte(key1), []byte("3")); err != nil {
+		panic(err)
+	}
+	val1, _ = db.Get([]byte(key1))
+	fmt.Printf("%s: %s\n", key1, val1)
+
 }
