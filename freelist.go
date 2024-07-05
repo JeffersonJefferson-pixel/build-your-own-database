@@ -36,13 +36,13 @@ func flnNext(node BNode) uint64 {
 
 func flnPtr(node BNode, idx int) uint64 {
 	assert(idx < flnSize(node), ErrIndexOutOfBound)
-	pos := HEADER + 8*idx
+	pos := FREE_LIST_HEADER + 8*idx
 	return binary.LittleEndian.Uint64(node.data[pos:])
 }
 
 func flnSetPtr(node BNode, idx int, ptr uint64) {
 	assert(idx < flnSize(node), ErrIndexOutOfBound)
-	pos := HEADER + 8*idx
+	pos := FREE_LIST_HEADER + 8*idx
 	binary.LittleEndian.PutUint64(node.data[pos:], ptr)
 }
 
@@ -53,9 +53,6 @@ func flnSetHeader(node BNode, size uint16, next uint64) {
 
 // number of items in the list
 func (fl *FreeList) Total() int {
-	if fl.head == 0 {
-		return 0
-	}
 	head := fl.get(fl.head)
 	return int(binary.LittleEndian.Uint64(head.data[4:12]))
 }
@@ -114,7 +111,7 @@ func (fl *FreeList) Update(popn int, freed []uint64) {
 	// prepare to construct the new list
 	total := fl.Total()
 	reuse := []uint64{}
-	for fl.head != 0 && len(reuse)*FREE_LIST_CAP < len(freed) {
+	for fl.head != 2 && len(reuse)*FREE_LIST_CAP < len(freed) {
 		node := fl.get(fl.head)
 		freed = append(freed, fl.head)
 		if popn >= flnSize(node) {
@@ -140,7 +137,7 @@ func (fl *FreeList) Update(popn int, freed []uint64) {
 		total -= flnSize(node)
 		fl.head = flnNext(node)
 	}
-	assert(len(reuse)*FREE_LIST_CAP >= len(freed) || fl.head == 0, ErrSomethingWentWrong)
+	assert(len(reuse)*FREE_LIST_CAP >= len(freed) || fl.head == 2, ErrSomethingWentWrong)
 
 	// phase 3
 	// prepend new nodes

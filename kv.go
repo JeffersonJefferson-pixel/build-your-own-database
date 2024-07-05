@@ -111,13 +111,18 @@ func masterLoad(db *KV) error {
 	if db.mmap.file == 0 {
 		// empty the file, the master page will be created on the first write.
 		db.page.flushed = 2 // reserved for the master page
-		db.free.head = 0
+		// create free list node
+		head := BNode{data: make([]byte, BTREE_PAGE_SIZE)}
+		db.free.head = db.free.new(head)
+		flnSetHeader(head, 1, db.free.head)
 		return nil
 	}
 
 	data := db.mmap.chunks[0]
 	root := binary.LittleEndian.Uint64(data[16:])
 	used := binary.LittleEndian.Uint64(data[24:])
+
+	// free list
 
 	// verify the page
 	if !bytes.Equal([]byte(DB_SIG), data[:16]) {
@@ -131,6 +136,7 @@ func masterLoad(db *KV) error {
 	}
 	db.tree.root = root
 	db.page.flushed = used
+	db.free.head = 2
 	return nil
 }
 
@@ -156,13 +162,10 @@ func (db *KV) pageNew(node BNode) uint64 {
 		// reuse deallocated pages
 		ptr = db.free.Get(db.page.nfree)
 		db.page.nfree++
-	} else {
-		// append a new page
-		ptr = db.page.flushed + uint64(db.page.nappend)
-		db.page.nappend++
+		db.page.updates[ptr] = node.data
+		return ptr
 	}
-	db.page.updates[ptr] = node.data
-	return ptr
+	return db.pageAppend(node)
 }
 
 // callback for BTree, deallocate a page.
@@ -218,17 +221,17 @@ func (db *KV) Open() error {
 	db.tree.new = db.pageNew
 	db.tree.del = db.pageDel
 
+	// free list
+	db.free.get = db.pageGet
+	db.free.new = db.pageAppend
+	db.free.use = db.pageUse
+	db.page.updates = map[uint64][]byte{}
+
 	// read the master page
 	err = masterLoad(db)
 	if err != nil {
 		goto fail
 	}
-
-	// free list
-	db.free.get = db.pageGet
-	db.free.new = db.pageNew
-	db.free.use = db.pageUse
-	db.page.updates = map[uint64][]byte{}
 
 	// done
 	return nil
@@ -303,6 +306,8 @@ func syncPages(db *KV) error {
 		return fmt.Errorf("fsync: %w", err)
 	}
 	db.page.flushed += uint64(db.page.nappend)
+	db.page.nfree = 0
+	db.page.nappend = 0
 	clear(db.page.updates)
 
 	// update & flush the master page
