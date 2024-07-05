@@ -450,6 +450,9 @@ func (tree *BTree) Insert(key []byte, val []byte) {
 }
 
 func (tree *BTree) Get(key []byte) ([]byte, bool) {
+	if tree.root == 0 {
+		return nil, false
+	}
 	root := tree.get(tree.root)
 	idx := nodeLookupLE(root, key)
 	if bytes.Equal(key, root.getKey(idx)) {

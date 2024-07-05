@@ -56,12 +56,17 @@ func main() {
 	}
 	key1 := "a"
 	key2 := "b"
+
+	// key1
+	val1, _ := db.Get([]byte(key1))
+	fmt.Printf("%s: %s\n", key1, val1)
 	if err := db.Set([]byte(key1), []byte("1")); err != nil {
 		panic(err)
 	}
-	val1, _ := db.Get([]byte(key1))
+	val1, _ = db.Get([]byte(key1))
 	fmt.Printf("%s: %s\n", key1, val1)
 
+	// key 2
 	val2, _ := db.Get([]byte(key2))
 	fmt.Printf("%s: %s\n", key2, val2)
 	if err := db.Set([]byte(key2), []byte("2")); err != nil {
