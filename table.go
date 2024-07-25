@@ -145,3 +145,121 @@ func getTableDefDB(db *DB, name string) *TableDef {
 	assert(err == nil, ErrSomethingWentWrong)
 	return tdef
 }
+
+// modes of updates
+const (
+	MODE_UPSERT      = 0 // insert or replace
+	MODE_UPDATE_ONLY = 1 // update existing keys
+	MODE_INSERT_ONLY = 2 // only add new keys
+)
+
+type InsertReq struct {
+	tree *BTree
+	// out
+	Added bool // added a new key
+	// in
+	Key  []byte
+	Val  []byte
+	Mode int
+}
+
+func (tree *BTree) InsertEx(req *InsertReq)
+func (db *KV) Update(key []byte, val []byte, mode int) (bool, error)
+
+func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
+	values, err := checkRecord(tdef, rec, len(tdef.Cols))
+	if err != nil {
+		return false, err
+	}
+
+	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
+	val := encodeValues(nil, values[tdef.PKeys:])
+
+	return db.kv.Update(key, val, mode)
+}
+
+// add a record
+func (db *DB) Set(table string, rec Record, mode int) (bool, error) {
+	tdef := getTableDef(db, table)
+	if tdef == nil {
+		return false, fmt.Errorf("table not found: %s", table)
+	}
+	return dbUpdate(db, tdef, rec, mode)
+}
+
+func (db *DB) Insert(table string, rec Record) (bool, error) {
+	return db.Set(table, rec, MODE_INSERT_ONLY)
+}
+
+func (db *DB) Update(table string, rec Record) (bool, error) {
+	return db.Set(table, rec, MODE_UPDATE_ONLY)
+}
+
+func (db *DB) Upsert(table string, rec Record) (bool, error) {
+	return db.Set(table, rec, MODE_UPSERT)
+}
+
+// delete a record by its primary key
+func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
+	values, err := checkRecord(tdef, rec, tdef.PKeys)
+	if err != nil {
+		return false, err
+	}
+
+	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
+	return db.kv.Del(key)
+}
+
+func (db *DB) Delete(table string, rec Record) (bool, error) {
+	tdef := getTableDef(db, table)
+	if tdef == nil {
+		return false, fmt.Errorf("table not found: %s", table)
+	}
+	return dbDelete(db, tdef, rec)
+}
+
+const TABLE_PREFIX_MIN = 3
+
+func (db *DB) TableNew(tdef *TableDef) error {
+	// check table definition
+	if err := tableDefCheck(tdef); err != nil {
+		return err
+	}
+
+	// check the existing table
+	table := (&Record{}).AddStr("name", []byte(tdef.Name))
+	ok, err := dbGet(db, TDEF_TABLE, table)
+	assert(err == nil, ErrSomethingWentWrong)
+	if ok {
+		return fmt.Errorf("table exists: %s", tdef.Name)
+	}
+
+	// allocate a new prefix
+	assert(tdef.Prefix == 0, ErrSomethingWentWrong)
+	tdef.Prefix = TABLE_PREFIX_MIN
+	meta := (&Record{}).AddStr("key", []byte("next_prefix"))
+	ok, err = dbGet(db, TDEF_META, meta)
+	assert(err == nil, ErrSomethingWentWrong)
+	if ok {
+		tdef.Prefix = binary.LittleEndian.Uint32(meta.Get("val").Str)
+		assert(tdef.Prefix > TABLE_PREFIX_MIN, ErrSomethingWentWrong)
+	} else {
+		meta.AddStr("val", make([]byte, 4))
+	}
+
+	// update the next prefix
+	binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+1)
+	_, err = dbUpdate(db, TDEF_META, *meta, 0)
+	if err != nil {
+		return err
+	}
+
+	// store the definition
+	val, err := json.Marshal(tdef)
+	assert(err == nil, ErrSomethingWentWrong)
+	table.AddStr("def", val)
+	_, err = dbUpdate(db, TDEF_TABLE, *table, 0)
+	return err
+}
+
+func tableDefCheck(tdef *TableDef) error
