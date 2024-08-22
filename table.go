@@ -1,34 +1,51 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 )
 
 const (
-	TYPE_ERROR = 0
-	TYPE_BYTES = 1
-	TYPE_INT64 = 2
+	TYPE_BYTES = 1 // string (of abitrary bytes)
+	TYPE_INT64 = 2 // integer; 64-bit signed
 )
 
 // table cell
 type Value struct {
-	Type uint32
+	Type uint32 // tagged union
 	I64  int64
 	Str  []byte
 }
 
-// table row
+// table row.
+// list of column names and values.
 type Record struct {
 	Cols []string
 	Vals []Value
 }
 
-func (rec *Record) AddStr(key string, val []byte) *Record
-func (rec *Record) AddInt64(key string, val int64) *Record
-func (rec *Record) Get(key string) *Value
+func (rec *Record) AddStr(col string, val []byte) *Record {
+	rec.Cols = append(rec.Cols, col)
+	rec.Vals = append(rec.Vals, Value{Type: TYPE_BYTES, Str: val})
+	return rec
+}
+func (rec *Record) AddInt64(col string, val int64) *Record {
+	rec.Cols = append(rec.Cols, col)
+	rec.Vals = append(rec.Vals, Value{Type: TYPE_INT64, I64: val})
+	return rec
+}
+func (rec *Record) Get(col string) *Value {
+	for i, recCol := range rec.Cols {
+		if recCol == col {
+			return &rec.Vals[i]
+		}
+	}
+	return nil
+}
 
+// wrapper of KV.
 type DB struct {
 	Path string
 	// internals
@@ -96,12 +113,69 @@ func dbGet(db *DB, tdef *TableDef, rec *Record) (bool, error) {
 // n == tdef.PKeys: record is exactly a primary key
 // n == len(tdef.Cols): record contains all columns
 func checkRecord(tdef *TableDef, rec Record, n int) ([]Value, error) {
-	return []Value{}, nil
+	// initalize values array
+	values := make([]Value, len(tdef.Cols))
+
+	for i := range n {
+		found := false
+		for j, recCol := range rec.Cols {
+			if tdef.Cols[i] == recCol {
+				values = append(values, rec.Vals[j])
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("column not found: %s", tdef.Cols[i])
+		}
+	}
+
+	return values, nil
 }
 
-func encodeValues(out []byte, vals []Value) []byte
+func encodeValues(out []byte, vals []Value) []byte {
+	for _, v := range vals {
+		switch v.Type {
+		case TYPE_INT64:
+			var buf [8]byte
+			u := uint64(v.I64) + (1 << 63)
+			binary.BigEndian.PutUint64(buf[:], u)
+			out = append(out, buf[:]...)
+		case TYPE_BYTES:
+			out = append(out, escapeString(v.Str)...)
+			out = append(out, 0)
+		default:
+			panic("value type is unexpected")
+		}
+	}
+	return out
+}
+
+func escapeString(in []byte) []byte {
+	zeros := bytes.Count(in, []byte{0})
+	ones := bytes.Count(in, []byte{1})
+	if zeros+ones == 0 {
+		return in
+	}
+
+	out := make([]byte, len(in)+zeros+ones)
+	pos := 0
+	for _, ch := range in {
+		if ch <= 1 {
+			out[pos+0] = 0x01
+			out[pos+1] = ch + 1
+			pos += 2
+		} else {
+			out[pos] = ch
+			pos += 1
+		}
+	}
+	return out
+}
+
 func decodeValues(in []byte, out []Value)
 
+// encode columns for the "key" of the kv
 func encodeKey(out []byte, prefix uint32, vals []Value) []byte {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], prefix)
@@ -153,7 +227,7 @@ const (
 	MODE_INSERT_ONLY = 2 // only add new keys
 )
 
-type InsertReq struct {
+type UpdateReq struct {
 	tree *BTree
 	// out
 	Added bool // added a new key
@@ -163,7 +237,8 @@ type InsertReq struct {
 	Mode int
 }
 
-func (tree *BTree) InsertEx(req *InsertReq)
+// only deal with a complete row.
+func (db *BTree) Update(req *UpdateReq) (bool, error)
 func (db *KV) Update(key []byte, val []byte, mode int) (bool, error)
 
 func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
@@ -263,3 +338,73 @@ func (db *DB) TableNew(tdef *TableDef) error {
 }
 
 func tableDefCheck(tdef *TableDef) error
+
+type Scanner struct {
+	// the range from key1 to key2
+	Cmp1 int
+	Cmp2 int
+	Key1 Record
+	Key2 Record
+	// internal
+	tdef   *TableDef
+	iter   *BIter
+	keyEnd []byte
+}
+
+// within the range or not?
+func (sc Scanner) Valid() bool {
+	if !sc.iter.Valid() {
+		return false
+	}
+	key, _ := sc.iter.Deref()
+	return cmpOK(key, sc.Cmp2, sc.keyEnd)
+}
+
+// move the underlying b-tree iterator
+func (sc *Scanner) Next() {
+	assert(sc.Valid(), ErrSomethingWentWrong)
+	if sc.Cmp1 > 0 {
+		sc.iter.Next()
+	} else {
+		sc.iter.Prev()
+	}
+}
+
+// fetch the current row()
+func (sc *Scanner) Dref(rec *Record)
+
+func (db *DB) Scan(table string, sc *Scanner) error {
+	tdef := getTableDef(db, table)
+	if tdef == nil {
+		return fmt.Errorf("table not foudn: %s", table)
+	}
+
+	return dbScan(db, tdef, sc)
+}
+
+func dbScan(db *DB, tdef *TableDef, sc *Scanner) error {
+	// sanity checks
+	switch {
+	case sc.Cmp1 > 0 && sc.Cmp2 < 0:
+	case sc.Cmp2 > 0 && sc.Cmp1 < 0:
+	default:
+		return fmt.Errorf("bad range")
+	}
+
+	values1, err := checkRecord(tdef, sc.Key1, tdef.PKeys)
+	if err != nil {
+		return err
+	}
+	values2, err := checkRecord(tdef, sc.Key2, tdef.PKeys)
+	if err != nil {
+		return err
+	}
+
+	sc.tdef = tdef
+
+	// seek to start key
+	keyStart := encodeKey(nil, tdef.Prefix, values1[:tdef.PKeys])
+	sc.keyEnd = encodeKey(nil, tdef.Prefix, values2[:tdef.PKeys])
+	sc.iter = db.kv.tree.Seek(keyStart, sc.Cmp1)
+	return nil
+}
