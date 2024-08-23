@@ -5,63 +5,21 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"slices"
 )
-
-const (
-	TYPE_BYTES = 1 // string (of abitrary bytes)
-	TYPE_INT64 = 2 // integer; 64-bit signed
-)
-
-// table cell
-type Value struct {
-	Type uint32 // tagged union
-	I64  int64
-	Str  []byte
-}
-
-// table row.
-// list of column names and values.
-type Record struct {
-	Cols []string
-	Vals []Value
-}
-
-func (rec *Record) AddStr(col string, val []byte) *Record {
-	rec.Cols = append(rec.Cols, col)
-	rec.Vals = append(rec.Vals, Value{Type: TYPE_BYTES, Str: val})
-	return rec
-}
-func (rec *Record) AddInt64(col string, val int64) *Record {
-	rec.Cols = append(rec.Cols, col)
-	rec.Vals = append(rec.Vals, Value{Type: TYPE_INT64, I64: val})
-	return rec
-}
-func (rec *Record) Get(col string) *Value {
-	for i, recCol := range rec.Cols {
-		if recCol == col {
-			return &rec.Vals[i]
-		}
-	}
-	return nil
-}
-
-// wrapper of KV.
-type DB struct {
-	Path string
-	// internals
-	kv     KV
-	tables map[string]*TableDef // cached table definition
-}
 
 // table defintion
 type TableDef struct {
 	// user defined
-	Name  string
-	Types []uint32 // column types
-	Cols  []string // column names
-	PKeys int      // the first `PKeys` columns are the primary key
+	Name    string
+	Types   []uint32 // column types
+	Cols    []string // column names
+	PKeys   int      // the first `PKeys` columns are the primary key
+	Indexes [][]string
 	// auto-assigned B-tree key prefixes for different tables
 	Prefix uint32
+	// each index is assigned a key prefix in the KV
+	IndexPrefixes []uint32
 }
 
 // internal table: metadata
@@ -184,15 +142,6 @@ func encodeKey(out []byte, prefix uint32, vals []Value) []byte {
 	return out
 }
 
-// get a single row by the primary key
-func (db *DB) Get(table string, rec *Record) (bool, error) {
-	tdef := getTableDef(db, table)
-	if tdef == nil {
-		return false, fmt.Errorf("table not found: %s", table)
-	}
-	return dbGet(db, tdef, rec)
-}
-
 func getTableDef(db *DB, name string) *TableDef {
 	tdef, ok := db.tables[name]
 	if !ok {
@@ -227,20 +176,7 @@ const (
 	MODE_INSERT_ONLY = 2 // only add new keys
 )
 
-type UpdateReq struct {
-	tree *BTree
-	// out
-	Added bool // added a new key
-	// in
-	Key  []byte
-	Val  []byte
-	Mode int
-}
-
 // only deal with a complete row.
-func (db *BTree) Update(req *UpdateReq) (bool, error)
-func (db *KV) Update(key []byte, val []byte, mode int) (bool, error)
-
 func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
 	values, err := checkRecord(tdef, rec, len(tdef.Cols))
 	if err != nil {
@@ -250,28 +186,21 @@ func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
 	val := encodeValues(nil, values[tdef.PKeys:])
 
-	return db.kv.Update(key, val, mode)
-}
-
-// add a record
-func (db *DB) Set(table string, rec Record, mode int) (bool, error) {
-	tdef := getTableDef(db, table)
-	if tdef == nil {
-		return false, fmt.Errorf("table not found: %s", table)
+	req := InsertReq{Key: key, Val: val, Mode: mode}
+	added, err := db.kv.Update(&req)
+	if err != nil || !req.Updated || len(tdef.Indexes) == 0 {
+		return added, err
 	}
-	return dbUpdate(db, tdef, rec, mode)
-}
 
-func (db *DB) Insert(table string, rec Record) (bool, error) {
-	return db.Set(table, rec, MODE_INSERT_ONLY)
-}
-
-func (db *DB) Update(table string, rec Record) (bool, error) {
-	return db.Set(table, rec, MODE_UPDATE_ONLY)
-}
-
-func (db *DB) Upsert(table string, rec Record) (bool, error) {
-	return db.Set(table, rec, MODE_UPSERT)
+	// maintain indexes
+	if req.Updated && !req.Added {
+		decodeValues(req.Old, values[tdef.PKeys:]) // get the old row
+		indexOp(db, tdef, Record{tdef.Cols, values}, INDEX_DEL)
+	}
+	if req.Updated {
+		indexOp(db, tdef, rec, INDEX_ADD)
+	}
+	return added, nil
 }
 
 // delete a record by its primary key
@@ -282,104 +211,34 @@ func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
 	}
 
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	return db.kv.Del(key)
-}
-
-func (db *DB) Delete(table string, rec Record) (bool, error) {
-	tdef := getTableDef(db, table)
-	if tdef == nil {
-		return false, fmt.Errorf("table not found: %s", table)
+	req := DeleteReq{Key: key}
+	deleted, err := db.kv.Del(&req)
+	if err != nil || !deleted || len(tdef.Indexes) == 0 {
+		return deleted, err
 	}
-	return dbDelete(db, tdef, rec)
+
+	// main indexes
+	if deleted {
+		decodeValues(req.Old, values[tdef.PKeys:]) // get the old row
+		indexOp(db, tdef, Record{tdef.Cols, values}, INDEX_DEL)
+	}
+	return true, nil
 }
 
 const TABLE_PREFIX_MIN = 3
 
-func (db *DB) TableNew(tdef *TableDef) error {
-	// check table definition
-	if err := tableDefCheck(tdef); err != nil {
-		return err
+func tableDefCheck(tdef *TableDef) error {
+	// verify the table definition
+
+	// verify the indexes
+	for i, index := range tdef.Indexes {
+		index, err := checkIndexKeys(tdef, index)
+		if err != nil {
+			return err
+		}
+		tdef.Indexes[i] = index
 	}
-
-	// check the existing table
-	table := (&Record{}).AddStr("name", []byte(tdef.Name))
-	ok, err := dbGet(db, TDEF_TABLE, table)
-	assert(err == nil, ErrSomethingWentWrong)
-	if ok {
-		return fmt.Errorf("table exists: %s", tdef.Name)
-	}
-
-	// allocate a new prefix
-	assert(tdef.Prefix == 0, ErrSomethingWentWrong)
-	tdef.Prefix = TABLE_PREFIX_MIN
-	meta := (&Record{}).AddStr("key", []byte("next_prefix"))
-	ok, err = dbGet(db, TDEF_META, meta)
-	assert(err == nil, ErrSomethingWentWrong)
-	if ok {
-		tdef.Prefix = binary.LittleEndian.Uint32(meta.Get("val").Str)
-		assert(tdef.Prefix > TABLE_PREFIX_MIN, ErrSomethingWentWrong)
-	} else {
-		meta.AddStr("val", make([]byte, 4))
-	}
-
-	// update the next prefix
-	binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+1)
-	_, err = dbUpdate(db, TDEF_META, *meta, 0)
-	if err != nil {
-		return err
-	}
-
-	// store the definition
-	val, err := json.Marshal(tdef)
-	assert(err == nil, ErrSomethingWentWrong)
-	table.AddStr("def", val)
-	_, err = dbUpdate(db, TDEF_TABLE, *table, 0)
-	return err
-}
-
-func tableDefCheck(tdef *TableDef) error
-
-type Scanner struct {
-	// the range from key1 to key2
-	Cmp1 int
-	Cmp2 int
-	Key1 Record
-	Key2 Record
-	// internal
-	tdef   *TableDef
-	iter   *BIter
-	keyEnd []byte
-}
-
-// within the range or not?
-func (sc Scanner) Valid() bool {
-	if !sc.iter.Valid() {
-		return false
-	}
-	key, _ := sc.iter.Deref()
-	return cmpOK(key, sc.Cmp2, sc.keyEnd)
-}
-
-// move the underlying b-tree iterator
-func (sc *Scanner) Next() {
-	assert(sc.Valid(), ErrSomethingWentWrong)
-	if sc.Cmp1 > 0 {
-		sc.iter.Next()
-	} else {
-		sc.iter.Prev()
-	}
-}
-
-// fetch the current row()
-func (sc *Scanner) Dref(rec *Record)
-
-func (db *DB) Scan(table string, sc *Scanner) error {
-	tdef := getTableDef(db, table)
-	if tdef == nil {
-		return fmt.Errorf("table not foudn: %s", table)
-	}
-
-	return dbScan(db, tdef, sc)
+	return nil
 }
 
 func dbScan(db *DB, tdef *TableDef, sc *Scanner) error {
@@ -407,4 +266,64 @@ func dbScan(db *DB, tdef *TableDef, sc *Scanner) error {
 	sc.keyEnd = encodeKey(nil, tdef.Prefix, values2[:tdef.PKeys])
 	sc.iter = db.kv.tree.Seek(keyStart, sc.Cmp1)
 	return nil
+}
+
+func checkIndexKeys(tdef *TableDef, index []string) ([]string, error) {
+	icols := map[string]bool{}
+	for _, c := range index {
+		// check the index column
+		if !slices.Contains(tdef.Cols, c) {
+			return nil, fmt.Errorf("index not found in tdef colums: %s", c)
+		}
+		icols[c] = true
+	}
+	// add primary key to the index
+	for _, c := range tdef.Cols[:tdef.PKeys] {
+		if !icols[c] {
+			index = append(index, c)
+		}
+	}
+	assert(len(index) < len(tdef.Cols), ErrSomethingWentWrong)
+	return index, nil
+}
+
+func colIndex(tdef *TableDef, col string) int {
+	for i, c := range tdef.Cols {
+		if c == col {
+			return i
+		}
+	}
+	return -1
+}
+
+const (
+	INDEX_ADD = 1
+	INDEX_DEL = 2
+)
+
+// updating a table with secondary indexes involves multiple keys in KV store.
+
+// maintain indexes after a record is added or removed
+func indexOp(db *DB, tdef *TableDef, rec Record, op int) {
+	key := make([]byte, 0, 256)
+	irec := make([]Value, len(tdef.Cols))
+	for i, index := range tdef.Indexes {
+		for j, c := range index {
+			irec[j] = *rec.Get(c)
+		}
+
+		// update the kv store
+		key = encodeKey(key[:0], tdef.IndexPrefixes[i], irec[:len(index)])
+		done, err := false, error(nil)
+		switch op {
+		case INDEX_ADD:
+			done, err = db.kv.Update(&InsertReq{Key: key})
+		case INDEX_DEL:
+			done, err = db.kv.Del(&DeleteReq{Key: key})
+		default:
+			panic(fmt.Sprintf("index operation not supported: %d", op))
+		}
+		assert(err == nil, ErrSomethingWentWrong)
+		assert(done, ErrSomethingWentWrong)
+	}
 }

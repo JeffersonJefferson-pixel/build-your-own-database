@@ -516,15 +516,30 @@ func (tree *BTree) SeekLE(key []byte) *BIter {
 		iter.path = append(iter.path, node)
 		iter.pos = append(iter.pos, idx)
 		ptr = node.getPtr((idx))
+		if node.btype() == BNODE_NODE {
+			ptr = node.getPtr(idx)
+		} else {
+			ptr = 0
+		}
 	}
 	return iter
 }
 
 // get the current KV pair
-func (iter *BIter) Deref() ([]byte, []byte)
+func (iter *BIter) Deref() ([]byte, []byte) {
+	// current level
+	level := len(iter.path) - 1
+	// current node
+	node := iter.path[level]
+	// current index
+	index := iter.pos[len(iter.pos)-1]
+	return node.getKey(index), node.getVal(index)
+}
 
 // precondition of the Deref()
-func (iter *BIter) Valid() bool
+func (iter *BIter) Valid() bool {
+	return len(iter.path)-1 >= 0
+}
 
 // moving backward and forward
 func (iter *BIter) Prev() {
@@ -568,3 +583,26 @@ func iterNext(iter *BIter, level int) {
 		iter.pos[level+1] = 0
 	}
 }
+
+type InsertReq struct {
+	tree *BTree
+	// out
+	Added   bool   // added a new key
+	Updated bool   // added a new key or an old key was updated
+	Old     []byte // the value before the update
+	// in
+	Key  []byte
+	Val  []byte
+	Mode int
+}
+
+type DeleteReq struct {
+	tree *BTree
+	// in
+	Key []byte
+	// out
+	Old []byte
+}
+
+func (tree *BTree) InsertEx(req *InsertReq)
+func (tree *BTree) DeleteEx(req *DeleteReq)

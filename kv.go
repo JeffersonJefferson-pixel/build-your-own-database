@@ -261,8 +261,8 @@ func (db *KV) Set(key []byte, val []byte) error {
 	return flushPages(db)
 }
 
-func (db *KV) Del(key []byte) (bool, error) {
-	deleted := db.tree.Delete(key)
+func (db *KV) Del(req *DeleteReq) (bool, error) {
+	deleted := db.tree.Delete(req.Key)
 	return deleted, flushPages(db)
 }
 
@@ -331,3 +331,5 @@ func (db *KV) pageAppend(node BNode) uint64 {
 func (db *KV) pageUse(ptr uint64, node BNode) {
 	db.page.updates[ptr] = node.data
 }
+
+func (db *KV) Update(req *InsertReq) (bool, error)
